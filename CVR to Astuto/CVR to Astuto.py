@@ -4,6 +4,7 @@ import os
 import time
 import logging
 import sys
+import schedule
 
 # Set up logging
 logging.basicConfig(
@@ -24,6 +25,7 @@ class PublicGitHubToAstuto:
             'Content-Type': 'application/json'
         }
         self.astuto_base_url = astuto_base_url.rstrip('/')
+        self.processed_issues = set()  # Track processed issues
 
     def test_connections(self):
         """Test both GitHub and Astuto API connections"""
@@ -111,6 +113,9 @@ class PublicGitHubToAstuto:
         logger.debug(f"Creating Astuto post for issue #{issue['number']}")
         url = f"{self.astuto_base_url}/api/v1/boards/{board_id}/posts"
         
+        # Convert labels to string
+        labels = ", ".join([label['name'] for label in issue.get('labels', [])])
+        
         data = {
             'title': issue['title'],
             'description': f"""
@@ -118,6 +123,7 @@ class PublicGitHubToAstuto:
                 ---\n
                 Originally from GitHub Issue #{issue['number']}\n
                 Status: {issue['state']}\n
+                Labels: {labels}\n
                 Created at: {issue['created_at']}\n
                 Original URL: {issue['html_url']}
             """,
@@ -134,8 +140,46 @@ class PublicGitHubToAstuto:
             logger.error(f"Error creating Astuto post for issue #{issue['number']}: {e}")
             return None
 
-def main():
+    def sync_new_issues(self, owner, repo, board_id):
+        """Sync only new issues that haven't been processed before"""
+        logger.info("Checking for new issues...")
+        issues = self.get_github_issues(owner, repo)
+        
+        new_issues = 0
+        for issue in issues:
+            issue_id = str(issue['number'])
+            if issue_id not in self.processed_issues:
+                logger.info(f"Found new issue #{issue_id}: {issue['title']}")
+                result = self.create_astuto_post(board_id, issue)
+                if result:
+                    self.processed_issues.add(issue_id)
+                    new_issues += 1
+                time.sleep(1)
+        
+        logger.info(f"Sync completed. {new_issues} new issues processed.")
+
+def run_sync():
+    """Run the synchronization process"""
     # Configuration
+    astuto_api_key = os.getenv('ASTUTO_API_KEY')
+    astuto_base_url = os.getenv('ASTUTO_BASE_URL')
+    board_id = os.getenv('ASTUTO_BOARD_ID')
+    
+    owner = "Alpha-Blend-Interactive"
+    repo = "ChilloutVR"
+
+    syncer = PublicGitHubToAstuto(astuto_api_key, astuto_base_url)
+    
+    # Test connections before syncing
+    connections = syncer.test_connections()
+    if not all(connections.values()):
+        logger.error("Connection tests failed. Skipping sync.")
+        return
+
+    syncer.sync_new_issues(owner, repo, board_id)
+
+def main():
+    # Validate environment variables
     required_vars = ['ASTUTO_API_KEY', 'ASTUTO_BASE_URL', 'ASTUTO_BOARD_ID']
     missing_vars = [var for var in required_vars if not os.getenv(var)]
     
@@ -143,40 +187,21 @@ def main():
         logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         sys.exit(1)
 
-    astuto_api_key = os.getenv('ASTUTO_API_KEY')
-    astuto_base_url = os.getenv('ASTUTO_BASE_URL')
-    board_id = os.getenv('ASTUTO_BOARD_ID')
+    # Schedule the sync to run every hour
+    schedule.every(1).hour.do(run_sync)
     
-    # GitHub repository details
-    owner = "Alpha-Blend-Interactive"
-    repo = "ChilloutVR"
-
-    # Initialize syncer
-    syncer = PublicGitHubToAstuto(astuto_api_key, astuto_base_url)
-
-    # Test connections
-    logger.info("Testing API connections...")
-    connections = syncer.test_connections()
+    # Run immediately on start
+    run_sync()
     
-    if not all(connections.values()):
-        logger.error("Connection tests failed. Please check your configuration and try again.")
-        sys.exit(1)
-
-    # Get GitHub issues
-    issues = syncer.get_github_issues(owner, repo)
-
-    # Sync each issue to Astuto
-    total_issues = len(issues)
-    successful_syncs = 0
-    
-    for index, issue in enumerate(issues, 1):
-        logger.info(f"Processing issue {index}/{total_issues}: #{issue['number']} - {issue['title']}")
-        result = syncer.create_astuto_post(board_id, issue)
-        if result:
-            successful_syncs += 1
-        time.sleep(1)
-
-    logger.info(f"Sync completed. Successfully synced {successful_syncs}/{total_issues} issues.")
+    # Keep the script running
+    logger.info("Script is running. Will check for new issues every hour.")
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
+    except KeyboardInterrupt:
+        logger.info("Script stopped by user")
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
