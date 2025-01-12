@@ -25,43 +25,6 @@ class PublicGitHubToAstuto:
             'Content-Type': 'application/json'
         }
         self.astuto_base_url = astuto_base_url.rstrip('/')
-        self.processed_issues = set()  # Track processed issues
-
-    def test_connections(self):
-        """Test both GitHub and Astuto API connections"""
-        connection_status = {
-            'github': False,
-            'astuto': False
-        }
-
-        # Test GitHub API
-        try:
-            logger.info("Testing GitHub API connection...")
-            response = requests.get(
-                f"{self.github_api_url}/rate_limit",
-                headers={'User-Agent': 'GitHub-Issue-Migrator'}
-            )
-            response.raise_for_status()
-            connection_status['github'] = True
-            remaining_rate = response.json()['resources']['core']['remaining']
-            logger.info(f"GitHub API connection successful. Rate limit remaining: {remaining_rate}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"GitHub API connection failed: {e}")
-
-        # Test Astuto API
-        try:
-            logger.info("Testing Astuto API connection...")
-            response = requests.get(
-                f"{self.astuto_base_url}/api/v1/boards",
-                headers=self.astuto_headers
-            )
-            response.raise_for_status()
-            connection_status['astuto'] = True
-            logger.info("Astuto API connection successful")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Astuto API connection failed: {e}")
-
-        return connection_status
 
     def get_github_issues(self, owner, repo):
         """Fetch issues from public GitHub repository using REST API"""
@@ -108,6 +71,26 @@ class PublicGitHubToAstuto:
         logger.info(f"Total issues fetched: {len(issues)}")
         return issues
 
+    def check_post_exists(self, board_id, issue_number):
+        """Check if a post already exists for this GitHub issue"""
+        try:
+            url = f"{self.astuto_base_url}/api/v1/boards/{board_id}/posts"
+            response = requests.get(url, headers=self.astuto_headers)
+            response.raise_for_status()
+            posts = response.json()
+
+            issue_reference = f"GitHub Issue #{issue_number}"
+            for post in posts:
+                if issue_reference in post.get('description', ''):
+                    logger.info(f"Found existing post for GitHub issue #{issue_number}")
+                    return True
+
+            return False
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error checking existing posts: {e}")
+            return False
+
     def create_astuto_post(self, board_id, issue):
         """Create a post in Astuto from GitHub issue"""
         logger.debug(f"Creating Astuto post for issue #{issue['number']}")
@@ -140,6 +123,42 @@ class PublicGitHubToAstuto:
             logger.error(f"Error creating Astuto post for issue #{issue['number']}: {e}")
             return None
 
+    def test_connections(self):
+        """Test both GitHub and Astuto API connections"""
+        connection_status = {
+            'github': False,
+            'astuto': False
+        }
+
+        # Test GitHub API
+        try:
+            logger.info("Testing GitHub API connection...")
+            response = requests.get(
+                f"{self.github_api_url}/rate_limit",
+                headers={'User-Agent': 'GitHub-Issue-Migrator'}
+            )
+            response.raise_for_status()
+            connection_status['github'] = True
+            remaining_rate = response.json()['resources']['core']['remaining']
+            logger.info(f"GitHub API connection successful. Rate limit remaining: {remaining_rate}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"GitHub API connection failed: {e}")
+
+        # Test Astuto API
+        try:
+            logger.info("Testing Astuto API connection...")
+            response = requests.get(
+                f"{self.astuto_base_url}/api/v1/boards",
+                headers=self.astuto_headers
+            )
+            response.raise_for_status()
+            connection_status['astuto'] = True
+            logger.info("Astuto API connection successful")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Astuto API connection failed: {e}")
+
+        return connection_status
+
     def sync_new_issues(self, owner, repo, board_id):
         """Sync only new issues that haven't been processed before"""
         logger.info("Checking for new issues...")
@@ -147,20 +166,21 @@ class PublicGitHubToAstuto:
         
         new_issues = 0
         for issue in issues:
-            issue_id = str(issue['number'])
-            if issue_id not in self.processed_issues:
-                logger.info(f"Found new issue #{issue_id}: {issue['title']}")
+            issue_number = issue['number']
+            
+            if not self.check_post_exists(board_id, issue_number):
+                logger.info(f"Creating new post for issue #{issue_number}: {issue['title']}")
                 result = self.create_astuto_post(board_id, issue)
                 if result:
-                    self.processed_issues.add(issue_id)
                     new_issues += 1
                 time.sleep(1)
+            else:
+                logger.debug(f"Skipping issue #{issue_number} - already exists in Astuto")
         
         logger.info(f"Sync completed. {new_issues} new issues processed.")
 
 def run_sync():
     """Run the synchronization process"""
-    # Configuration
     astuto_api_key = os.getenv('ASTUTO_API_KEY')
     astuto_base_url = os.getenv('ASTUTO_BASE_URL')
     board_id = os.getenv('ASTUTO_BOARD_ID')
@@ -170,7 +190,6 @@ def run_sync():
 
     syncer = PublicGitHubToAstuto(astuto_api_key, astuto_base_url)
     
-    # Test connections before syncing
     connections = syncer.test_connections()
     if not all(connections.values()):
         logger.error("Connection tests failed. Skipping sync.")
@@ -179,7 +198,6 @@ def run_sync():
     syncer.sync_new_issues(owner, repo, board_id)
 
 def main():
-    # Validate environment variables
     required_vars = ['ASTUTO_API_KEY', 'ASTUTO_BASE_URL', 'ASTUTO_BOARD_ID']
     missing_vars = [var for var in required_vars if not os.getenv(var)]
     
@@ -187,13 +205,10 @@ def main():
         logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         sys.exit(1)
 
-    # Schedule the sync to run every hour
     schedule.every(1).hour.do(run_sync)
     
-    # Run immediately on start
     run_sync()
     
-    # Keep the script running
     logger.info("Script is running. Will check for new issues every hour.")
     try:
         while True:
