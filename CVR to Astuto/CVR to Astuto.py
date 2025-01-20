@@ -175,8 +175,8 @@ class PublicGitHubToAstuto:
             return None
 
     def update_post_status(self, post_id, issue):
-        """Update post status based on GitHub issue labels"""
-        # Map GitHub labels to Astuto status IDs
+        """Update post status based on GitHub issue labels, prioritizing higher status IDs"""
+        # Map GitHub labels to Astuto status IDs (ordered by priority, lowest to highest)
         label_to_status = {
             "bug": 5,
             "documentation": 6,
@@ -189,19 +189,23 @@ class PublicGitHubToAstuto:
             "wontfix": 13
         }
         
-        # Get status ID from labels
-        status_id = None
+        # Get highest status ID from labels
+        highest_status_id = None
+        highest_label_name = None
         for label in issue.get('labels', []):
             label_name = label['name'].lower()
             if label_name in label_to_status:
-                status_id = label_to_status[label_name]
-                logger.info(f"Found matching status ID {status_id} for label {label_name}")
-                break
-        
-        if status_id:
+                current_status_id = label_to_status[label_name]
+                # Always prefer higher status IDs
+                if highest_status_id is None or current_status_id > highest_status_id:
+                    highest_status_id = current_status_id
+                    highest_label_name = label_name
+                    logger.info(f"Found higher priority status ID {highest_status_id} for label {label_name}")
+    
+        if highest_status_id:
             url = f"{self.astuto_base_url}/api/v1/posts/{post_id}/update_status"
             payload = {
-                "post_status_id": status_id
+                "post_status_id": highest_status_id
             }
             
             try:
@@ -213,7 +217,7 @@ class PublicGitHubToAstuto:
                 )
                 
                 response.raise_for_status()
-                logger.info(f"Successfully updated post {post_id} status to {status_id}")
+                logger.info(f"Successfully updated post {post_id} status to {highest_status_id} (from label {highest_label_name})")
                 return True
             except requests.exceptions.RequestException as e:
                 logger.error(f"Error updating post status: {e}")
