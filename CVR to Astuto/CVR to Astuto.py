@@ -5,6 +5,7 @@ import time
 import logging
 import sys
 import schedule
+import json
 
 # Set up logging
 logging.basicConfig(
@@ -22,9 +23,57 @@ class PublicGitHubToAstuto:
         self.github_api_url = "https://api.github.com"
         self.astuto_headers = {
             'Authorization': f'Bearer {astuto_api_key}',
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
         }
         self.astuto_base_url = astuto_base_url.rstrip('/')
+
+    def print_astuto_info(self):
+        """Print all available Astuto information"""
+        logger.info("Fetching Astuto information...")
+        
+        # Get boards
+        try:
+            response = requests.get(f"{self.astuto_base_url}/api/v1/boards", headers=self.astuto_headers)
+            response.raise_for_status()
+            boards = response.json()
+            
+            print("\n=== ASTUTO BOARDS ===")
+            print(json.dumps(boards, indent=2))
+            
+            # Print formatted board information
+            print("\nAvailable Boards:")
+            print("-----------------")
+            for board in boards:
+                print(f"Board ID: {board.get('id')}")
+                print(f"Name: {board.get('name')}")
+                print(f"Description: {board.get('description')}")
+                print(f"Slug: {board.get('slug')}")
+                print("-----------------")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching boards: {e}")
+            
+        # Get post statuses
+        try:
+            response = requests.get(f"{self.astuto_base_url}/api/v1/post_statuses", headers=self.astuto_headers)
+            response.raise_for_status()
+            statuses = response.json()
+            
+            print("\n=== POST STATUSES ===")
+            print(json.dumps(statuses, indent=2))
+            
+            # Print formatted status information
+            print("\nAvailable Post Statuses:")
+            print("----------------------")
+            for status in statuses:
+                print(f"Status ID: {status.get('id')}")
+                print(f"Name: {status.get('name')}")
+                print(f"Color: {status.get('color')}")
+                print("----------------------")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching post statuses: {e}")
 
     def get_github_issues(self, owner, repo):
         """Fetch issues from public GitHub repository using REST API"""
@@ -74,7 +123,7 @@ class PublicGitHubToAstuto:
     def check_post_exists(self, board_id, issue_number):
         """Check if a post already exists for this GitHub issue"""
         try:
-            url = f"{self.astuto_base_url}/api/v1/boards/{board_id}/posts"
+            url = f"{self.astuto_base_url}/api/v1/posts"
             response = requests.get(url, headers=self.astuto_headers)
             response.raise_for_status()
             posts = response.json()
@@ -94,33 +143,56 @@ class PublicGitHubToAstuto:
     def create_astuto_post(self, board_id, issue):
         """Create a post in Astuto from GitHub issue"""
         logger.debug(f"Creating Astuto post for issue #{issue['number']}")
-        url = f"{self.astuto_base_url}/api/v1/boards/{board_id}/posts"
+        url = f"{self.astuto_base_url}/api/v1/posts"
         
         # Convert labels to string
         labels = ", ".join([label['name'] for label in issue.get('labels', [])])
         
-        data = {
-            'title': issue['title'],
-            'description': f"""
-                {issue.get('body', 'No description provided')}\n\n
-                ---\n
-                Originally from GitHub Issue #{issue['number']}\n
-                Status: {issue['state']}\n
-                Labels: {labels}\n
-                Created at: {issue['created_at']}\n
-                Original URL: {issue['html_url']}
-            """,
-            'board_id': board_id,
-            'status': 'under_review' if issue['state'] == 'open' else 'closed'
+        # Truncate title to 128 characters
+        title = issue['title']
+        if len(title) > 128:
+            title = title[:125] + "..."
+        
+        # Format description
+        description = (
+            f"{issue.get('body', 'No description provided')}\n\n"
+            f"---\n"
+            f"Originally from GitHub Issue #{issue['number']}\n"
+            f"Status: {issue['state']}\n"
+            f"Labels: {labels}\n"
+            f"Created at: {issue['created_at']}\n"
+            f"Original URL: {issue['html_url']}"
+        )
+
+        # Create request payload exactly matching the API schema
+        payload = {
+            "title": title,
+            "description": description,
+            "board_id": int(board_id)
         }
 
         try:
-            response = requests.post(url, json=data, headers=self.astuto_headers)
+            response = requests.post(
+                url,
+                json=payload,
+                headers=self.astuto_headers,
+                verify=True
+            )
+            
+            # Log request details for debugging
+            logger.debug(f"Request URL: {url}")
+            logger.debug(f"Request Headers: {self.astuto_headers}")
+            logger.debug(f"Request Payload: {payload}")
+            logger.debug(f"Response Status: {response.status_code}")
+            logger.debug(f"Response Content: {response.text}")
+            
             response.raise_for_status()
             logger.info(f"Successfully created Astuto post for issue #{issue['number']}")
             return response.json()
         except requests.exceptions.RequestException as e:
             logger.error(f"Error creating Astuto post for issue #{issue['number']}: {e}")
+            if hasattr(e.response, 'text'):
+                logger.error(f"Response content: {e.response.text}")
             return None
 
     def test_connections(self):
@@ -189,6 +261,9 @@ def run_sync():
     repo = "ChilloutVR"
 
     syncer = PublicGitHubToAstuto(astuto_api_key, astuto_base_url)
+    
+    # Print Astuto information before running sync
+    syncer.print_astuto_info()
     
     connections = syncer.test_connections()
     if not all(connections.values()):
