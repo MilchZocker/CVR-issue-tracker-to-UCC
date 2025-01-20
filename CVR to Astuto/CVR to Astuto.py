@@ -120,26 +120,6 @@ class PublicGitHubToAstuto:
         logger.info(f"Total issues fetched: {len(issues)}")
         return issues
 
-    def check_post_exists(self, board_id, issue_number):
-        """Check if a post already exists for this GitHub issue"""
-        try:
-            url = f"{self.astuto_base_url}/api/v1/posts"
-            response = requests.get(url, headers=self.astuto_headers)
-            response.raise_for_status()
-            posts = response.json()
-
-            issue_reference = f"GitHub Issue #{issue_number}"
-            for post in posts:
-                if issue_reference in post.get('description', ''):
-                    logger.info(f"Found existing post for GitHub issue #{issue_number}")
-                    return True
-
-            return False
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error checking existing posts: {e}")
-            return False
-
     def create_astuto_post(self, board_id, issue):
         """Create a post in Astuto from GitHub issue"""
         logger.debug(f"Creating Astuto post for issue #{issue['number']}")
@@ -164,11 +144,11 @@ class PublicGitHubToAstuto:
             f"Original URL: {issue['html_url']}"
         )
 
-        # Create request payload exactly matching the API schema
+        # Create request payload
         payload = {
             "title": title,
             "description": description,
-            "board_id": int(board_id)
+            "board_id": str(board_id)
         }
 
         try:
@@ -179,21 +159,67 @@ class PublicGitHubToAstuto:
                 verify=True
             )
             
-            # Log request details for debugging
-            logger.debug(f"Request URL: {url}")
-            logger.debug(f"Request Headers: {self.astuto_headers}")
-            logger.debug(f"Request Payload: {payload}")
-            logger.debug(f"Response Status: {response.status_code}")
-            logger.debug(f"Response Content: {response.text}")
-            
             response.raise_for_status()
+            created_post = response.json()
             logger.info(f"Successfully created Astuto post for issue #{issue['number']}")
-            return response.json()
+            
+            # Update post status if labels exist
+            if created_post and 'id' in created_post:
+                self.update_post_status(created_post['id'], issue)
+                
+            return created_post
         except requests.exceptions.RequestException as e:
             logger.error(f"Error creating Astuto post for issue #{issue['number']}: {e}")
             if hasattr(e.response, 'text'):
                 logger.error(f"Response content: {e.response.text}")
             return None
+
+    def update_post_status(self, post_id, issue):
+        """Update post status based on GitHub issue labels"""
+        # Map GitHub labels to Astuto status IDs
+        label_to_status = {
+            "bug": 5,
+            "documentation": 6,
+            "duplicate": 7,
+            "enhancement": 8,
+            "good first issue": 9,
+            "help wanted": 10,
+            "invalid": 11,
+            "question": 12,
+            "wontfix": 13
+        }
+        
+        # Get status ID from labels
+        status_id = None
+        for label in issue.get('labels', []):
+            label_name = label['name'].lower()
+            if label_name in label_to_status:
+                status_id = label_to_status[label_name]
+                logger.info(f"Found matching status ID {status_id} for label {label_name}")
+                break
+        
+        if status_id:
+            url = f"{self.astuto_base_url}/api/v1/posts/{post_id}/update_status"
+            payload = {
+                "post_status_id": status_id
+            }
+            
+            try:
+                response = requests.put(
+                    url,
+                    json=payload,
+                    headers=self.astuto_headers,
+                    verify=True
+                )
+                
+                response.raise_for_status()
+                logger.info(f"Successfully updated post {post_id} status to {status_id}")
+                return True
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error updating post status: {e}")
+                if hasattr(e.response, 'text'):
+                    logger.error(f"Response content: {e.response.text}")
+                return False
 
     def test_connections(self):
         """Test both GitHub and Astuto API connections"""
@@ -232,22 +258,44 @@ class PublicGitHubToAstuto:
         return connection_status
 
     def sync_new_issues(self, owner, repo, board_id):
-        """Sync only new issues that haven't been processed before"""
+        """Sync only new issues that haven't been processed before and update existing post statuses"""
         logger.info("Checking for new issues...")
         issues = self.get_github_issues(owner, repo)
+        
+        # Get all existing posts
+        try:
+            url = f"{self.astuto_base_url}/api/v1/posts"
+            response = requests.get(url, headers=self.astuto_headers)
+            response.raise_for_status()
+            existing_posts = response.json()
+            logger.info(f"Found {len(existing_posts)} existing posts")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching existing posts: {e}")
+            return
         
         new_issues = 0
         for issue in issues:
             issue_number = issue['number']
+            issue_reference = f"GitHub Issue #{issue_number}"
             
-            if not self.check_post_exists(board_id, issue_number):
+            # Check if post exists and get its ID
+            existing_post = None
+            for post in existing_posts:
+                if issue_reference in post.get('description', ''):
+                    existing_post = post
+                    break
+            
+            if existing_post:
+                # Update status of existing post
+                logger.debug(f"Updating status for existing post #{existing_post['id']}")
+                self.update_post_status(existing_post['id'], issue)
+            else:
+                # Create new post
                 logger.info(f"Creating new post for issue #{issue_number}: {issue['title']}")
                 result = self.create_astuto_post(board_id, issue)
                 if result:
                     new_issues += 1
                 time.sleep(1)
-            else:
-                logger.debug(f"Skipping issue #{issue_number} - already exists in Astuto")
         
         logger.info(f"Sync completed. {new_issues} new issues processed.")
 
