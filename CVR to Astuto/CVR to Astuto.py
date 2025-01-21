@@ -30,21 +30,21 @@ class PublicGitHubToAstuto:
 
     def determine_board(self, issue_labels):
         """Determine which board to use based on issue labels"""
-        # Default to board 1 (bug) if no labels exist
+        # Default to board 2 (bug) if no labels exist
         if not issue_labels:
-            return "1"
+            return "2"
             
         for label in issue_labels:
             label_name = label['name'].lower()
             if label_name == "bug":
-                return "1"
-            elif label_name == "documentation":
                 return "2"
-            elif label_name == "enhancement":
+            elif label_name == "documentation":
                 return "3"
+            elif label_name == "enhancement":
+                return "1"
         
         # Default to board 1 (bug) if no matching labels found
-        return "1"
+        return "2"
 
     def print_astuto_info(self):
         """Print all available Astuto information"""
