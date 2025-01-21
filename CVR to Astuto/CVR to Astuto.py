@@ -133,7 +133,7 @@ class PublicGitHubToAstuto:
         if len(title) > 128:
             title = title[:125] + "..."
         
-        # Format description
+        # Format description with markdown link
         description = (
             f"{issue.get('body', 'No description provided')}\n\n"
             f"---\n"
@@ -141,7 +141,7 @@ class PublicGitHubToAstuto:
             f"Status: {issue['state']}\n"
             f"Labels: {labels}\n"
             f"Created at: {issue['created_at']}\n"
-            f"Original URL: {issue['html_url']}"
+            f"Original URL: [{issue['html_url']}]({issue['html_url']})"
         )
 
         # Create request payload
@@ -225,6 +225,83 @@ class PublicGitHubToAstuto:
                     logger.error(f"Response content: {e.response.text}")
                 return False
 
+    def sync_comments(self, post_id, issue_number, owner, repo):
+        """Sync comments from GitHub issue to Astuto post"""
+        try:
+            # Fetch GitHub comments
+            url = f"{self.github_api_url}/repos/{owner}/{repo}/issues/{issue_number}/comments"
+            headers = {'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'GitHub-Issue-Migrator'}
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            github_comments = response.json()
+            
+            # Get all existing comments
+            create_url = f"{self.astuto_base_url}/api/v1/comments"
+            try:
+                response = requests.get(create_url, headers=self.astuto_headers)
+                response.raise_for_status()
+                existing_comments = response.json()
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error fetching existing comments: {e}")
+                return
+            
+            # Create or update comments
+            for github_comment in github_comments:
+                comment_id = str(github_comment['id'])
+                
+                # Format new comment body
+                new_comment_body = (
+                    f"{github_comment['body']}\n\n"
+                    f"---\n"
+                    f"Originally commented by: [{github_comment['user']['login']}]({github_comment['user']['html_url']})\n"
+                    f"Created at: {github_comment['created_at']}\n"
+                    f"GitHub Comment URL: [{github_comment['html_url']}]({github_comment['html_url']})\n"
+                    f"GitHub Comment ID: {comment_id}"
+                )
+                
+                # Check if comment exists
+                existing_comment = None
+                for comment in existing_comments:
+                    if f"GitHub Comment ID: {comment_id}" in comment.get('body', ''):
+                        existing_comment = comment
+                        break
+                
+                # Create payload
+                payload = {
+                    "body": new_comment_body,
+                    "post_id": int(post_id),
+                    "is_post_update": True
+                }
+                
+                try:
+                    if existing_comment:
+                        # Update if content changed
+                        if existing_comment['body'] != new_comment_body:
+                            update_url = f"{self.astuto_base_url}/api/v1/comments/{existing_comment['id']}"
+                            response = requests.put(update_url, json=payload, headers=self.astuto_headers)
+                            response.raise_for_status()
+                            logger.info(f"Updated existing comment for post {post_id} from GitHub comment {comment_id}")
+                        else:
+                            logger.debug(f"Comment {comment_id} already exists and is up to date")
+                    else:
+                        # Create new comment
+                        response = requests.post(create_url, json=payload, headers=self.astuto_headers)
+                        response.raise_for_status()
+                        logger.info(f"Created new comment for post {post_id} from GitHub comment {comment_id}")
+                    
+                    time.sleep(1)  # Add small delay between comments
+                    
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Error handling comment: {e}")
+                    if hasattr(e.response, 'text'):
+                        logger.error(f"Response content: {e.response.text}")
+                    continue
+                    
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching GitHub comments: {e}")
+            if hasattr(e.response, 'text'):
+                logger.error(f"Response content: {e.response.text}")
+
     def test_connections(self):
         """Test both GitHub and Astuto API connections"""
         connection_status = {
@@ -262,8 +339,8 @@ class PublicGitHubToAstuto:
         return connection_status
 
     def sync_new_issues(self, owner, repo, board_id):
-        """Sync only new issues that haven't been processed before and update existing post statuses"""
-        logger.info("Checking for new issues...")
+        """Sync new issues and comments"""
+        logger.info("Checking for new issues and comments...")
         issues = self.get_github_issues(owner, repo)
         
         # Get all existing posts
@@ -293,12 +370,16 @@ class PublicGitHubToAstuto:
                 # Update status of existing post
                 logger.debug(f"Updating status for existing post #{existing_post['id']}")
                 self.update_post_status(existing_post['id'], issue)
+                # Sync comments for existing post
+                self.sync_comments(existing_post['id'], issue_number, owner, repo)
             else:
                 # Create new post
                 logger.info(f"Creating new post for issue #{issue_number}: {issue['title']}")
                 result = self.create_astuto_post(board_id, issue)
                 if result:
                     new_issues += 1
+                    # Sync comments for new post
+                    self.sync_comments(result['id'], issue_number, owner, repo)
                 time.sleep(1)
         
         logger.info(f"Sync completed. {new_issues} new issues processed.")
@@ -342,7 +423,7 @@ def main():
             schedule.run_pending()
             time.sleep(60)
     except KeyboardInterrupt:
-        logger.info("Script stopped by user")
+        logger.info("Script stoped by user")
         sys.exit(0)
 
 if __name__ == "__main__":
