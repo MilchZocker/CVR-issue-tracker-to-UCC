@@ -28,6 +28,24 @@ class PublicGitHubToAstuto:
         }
         self.astuto_base_url = astuto_base_url.rstrip('/')
 
+    def determine_board(self, issue_labels):
+        """Determine which board to use based on issue labels"""
+        # Default to board 1 (bug) if no labels exist
+        if not issue_labels:
+            return "1"
+            
+        for label in issue_labels:
+            label_name = label['name'].lower()
+            if label_name == "bug":
+                return "1"
+            elif label_name == "documentation":
+                return "2"
+            elif label_name == "enhancement":
+                return "3"
+        
+        # Default to board 1 (bug) if no matching labels found
+        return "1"
+
     def print_astuto_info(self):
         """Print all available Astuto information"""
         logger.info("Fetching Astuto information...")
@@ -175,8 +193,8 @@ class PublicGitHubToAstuto:
             return None
 
     def update_post_status(self, post_id, issue):
-        """Update post status based on GitHub issue labels, prioritizing higher status IDs"""
-        # Map GitHub labels to Astuto status IDs (ordered by priority, lowest to highest)
+        """Update post status based on GitHub issue labels"""
+        # Map GitHub labels to Astuto status IDs
         label_to_status = {
             "bug": 5,
             "documentation": 6,
@@ -189,14 +207,12 @@ class PublicGitHubToAstuto:
             "wontfix": 13
         }
         
-        # Get highest status ID from labels
         highest_status_id = None
         highest_label_name = None
         for label in issue.get('labels', []):
             label_name = label['name'].lower()
             if label_name in label_to_status:
                 current_status_id = label_to_status[label_name]
-                # Always prefer higher status IDs
                 if highest_status_id is None or current_status_id > highest_status_id:
                     highest_status_id = current_status_id
                     highest_label_name = label_name
@@ -204,18 +220,10 @@ class PublicGitHubToAstuto:
     
         if highest_status_id:
             url = f"{self.astuto_base_url}/api/v1/posts/{post_id}/update_status"
-            payload = {
-                "post_status_id": highest_status_id
-            }
+            payload = {"post_status_id": highest_status_id}
             
             try:
-                response = requests.put(
-                    url,
-                    json=payload,
-                    headers=self.astuto_headers,
-                    verify=True
-                )
-                
+                response = requests.put(url, json=payload, headers=self.astuto_headers)
                 response.raise_for_status()
                 logger.info(f"Successfully updated post {post_id} status to {highest_status_id} (from label {highest_label_name})")
                 return True
@@ -359,6 +367,10 @@ class PublicGitHubToAstuto:
             issue_number = issue['number']
             issue_reference = f"GitHub Issue #{issue_number}"
             
+            # Determine appropriate board based on labels
+            assigned_board = self.determine_board(issue.get('labels', []))
+            logger.info(f"Issue #{issue_number} assigned to board {assigned_board}")
+            
             # Check if post exists and get its ID
             existing_post = None
             for post in existing_posts:
@@ -367,15 +379,31 @@ class PublicGitHubToAstuto:
                     break
             
             if existing_post:
+                # Check if board needs to be updated
+                current_board = str(existing_post.get('board_id'))
+                if current_board != str(assigned_board):
+                    logger.info(f"Moving post {existing_post['id']} from board {current_board} to {assigned_board}")
+                    url = f"{self.astuto_base_url}/api/v1/posts/{existing_post['id']}/update_board"
+                    try:
+                        response = requests.put(
+                            url,
+                            json={"board_id": int(assigned_board)},
+                            headers=self.astuto_headers
+                        )
+                        response.raise_for_status()
+                        logger.info(f"Successfully moved post {existing_post['id']} to board {assigned_board}")
+                    except requests.exceptions.RequestException as e:
+                        logger.error(f"Error updating board: {e}")
+                
                 # Update status of existing post
-                logger.debug(f"Updating status for existing post #{existing_post['id']}")
                 self.update_post_status(existing_post['id'], issue)
+                
                 # Sync comments for existing post
                 self.sync_comments(existing_post['id'], issue_number, owner, repo)
             else:
-                # Create new post
-                logger.info(f"Creating new post for issue #{issue_number}: {issue['title']}")
-                result = self.create_astuto_post(board_id, issue)
+                # Create new post in correct board
+                logger.info(f"Creating new post for issue #{issue_number} in board {assigned_board}")
+                result = self.create_astuto_post(assigned_board, issue)
                 if result:
                     new_issues += 1
                     # Sync comments for new post
@@ -423,7 +451,7 @@ def main():
             schedule.run_pending()
             time.sleep(60)
     except KeyboardInterrupt:
-        logger.info("Script stoped by user")
+        logger.info("Script stopped by user")
         sys.exit(0)
 
 if __name__ == "__main__":
