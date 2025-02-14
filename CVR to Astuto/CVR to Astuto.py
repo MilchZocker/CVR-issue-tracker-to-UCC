@@ -27,23 +27,49 @@ class PublicGitHubToAstuto:
             'Accept': 'application/json'
         }
         self.astuto_base_url = astuto_base_url.rstrip('/')
+        self.astuto_boards = {}
+        self.astuto_statuses = {}
+        self.initialize_astuto_mappings()
+
+    def initialize_astuto_mappings(self):
+        """Initialize mappings for Astuto boards and statuses"""
+        # Get boards
+        try:
+            response = requests.get(f"{self.astuto_base_url}/api/v1/boards", headers=self.astuto_headers)
+            response.raise_for_status()
+            boards = response.json()
+            # Create mapping of board names to IDs (lowercase for case-insensitive matching)
+            self.astuto_boards = {board['name'].lower(): str(board['id']) for board in boards}
+            logger.info(f"Loaded {len(self.astuto_boards)} Astuto boards")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching Astuto boards: {e}")
+
+        # Get statuses
+        try:
+            response = requests.get(f"{self.astuto_base_url}/api/v1/post_statuses", headers=self.astuto_headers)
+            response.raise_for_status()
+            statuses = response.json()
+            # Create mapping of status names to IDs (lowercase for case-insensitive matching)
+            self.astuto_statuses = {status['name'].lower(): status['id'] for status in statuses}
+            logger.info(f"Loaded {len(self.astuto_statuses)} Astuto statuses")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching Astuto statuses: {e}")
 
     def determine_board(self, issue_labels):
         """Determine which board to use based on issue labels"""
-        # Default to board 2 (bug) if no labels exist
-        if not issue_labels:
-            return "2"
-            
+        # First check for source: hellonext label - this takes priority
         for label in issue_labels:
             label_name = label['name'].lower()
-            if label_name == "bug":
-                return "2"
-            elif label_name == "documentation":
-                return "3"
-            elif label_name == "enhancement":
-                return "1"
+            if label_name == "source: hellonext":
+                return "4"
         
-        # Default to board 1 (bug) if no matching labels found
+        # Check if any label matches an Astuto board name
+        for label in issue_labels:
+            label_name = label['name'].lower()
+            if label_name in self.astuto_boards:
+                return self.astuto_boards[label_name]
+        
+        # Default to board 2 (Bug Reports) if no matching labels found
         return "2"
 
     def print_astuto_info(self):
@@ -194,38 +220,30 @@ class PublicGitHubToAstuto:
 
     def update_post_status(self, post_id, issue):
         """Update post status based on GitHub issue labels"""
-        # Map GitHub labels to Astuto status IDs
-        label_to_status = {
-            "bug": 5,
-            "documentation": 6,
-            "duplicate": 7,
-            "enhancement": 8,
-            "good first issue": 9,
-            "help wanted": 10,
-            "invalid": 11,
-            "question": 12,
-            "wontfix": 13
-        }
+        matched_statuses = []
         
-        highest_status_id = None
-        highest_label_name = None
+        # Match GitHub labels to Astuto statuses
         for label in issue.get('labels', []):
             label_name = label['name'].lower()
-            if label_name in label_to_status:
-                current_status_id = label_to_status[label_name]
-                if highest_status_id is None or current_status_id > highest_status_id:
-                    highest_status_id = current_status_id
-                    highest_label_name = label_name
-                    logger.info(f"Found higher priority status ID {highest_status_id} for label {label_name}")
-    
-        if highest_status_id:
+            if label_name in self.astuto_statuses:
+                matched_statuses.append((label_name, self.astuto_statuses[label_name]))
+                logger.info(f"Matched label {label_name} to status ID {self.astuto_statuses[label_name]}")
+        
+        # If no status matches found and it's in bug board, set bug status
+        if not matched_statuses and str(issue.get('board_id')) == "2":
+            if "bug" in self.astuto_statuses:
+                matched_statuses.append(("bug", self.astuto_statuses["bug"]))
+        
+        # Apply the highest status ID found
+        if matched_statuses:
+            highest_status = max(matched_statuses, key=lambda x: x[1])
             url = f"{self.astuto_base_url}/api/v1/posts/{post_id}/update_status"
-            payload = {"post_status_id": highest_status_id}
+            payload = {"post_status_id": highest_status[1]}
             
             try:
                 response = requests.put(url, json=payload, headers=self.astuto_headers)
                 response.raise_for_status()
-                logger.info(f"Successfully updated post {post_id} status to {highest_status_id} (from label {highest_label_name})")
+                logger.info(f"Successfully updated post {post_id} status to {highest_status[1]} (from label {highest_status[0]})")
                 return True
             except requests.exceptions.RequestException as e:
                 logger.error(f"Error updating post status: {e}")
