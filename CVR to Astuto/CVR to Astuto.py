@@ -57,20 +57,37 @@ class PublicGitHubToAstuto:
 
     def determine_board(self, issue_labels):
         """Determine which board to use based on issue labels"""
-        # First check for source: hellonext label - this takes priority
+        # Store the reason for board assignment for logging
+        assignment_reason = "default"
+        assigned_board = "2"  # Default to Bug Reports
+
         for label in issue_labels:
             label_name = label['name'].lower()
+            
+            # Priority 1: Hellonext source
             if label_name == "source: hellonext":
-                return "4"
-        
-        # Check if any label matches an Astuto board name
-        for label in issue_labels:
-            label_name = label['name'].lower()
+                assigned_board = "4"
+                assignment_reason = "hellonext source"
+                break
+                
+            # Priority 2: Direct board name matches
             if label_name in self.astuto_boards:
-                return self.astuto_boards[label_name]
-        
-        # Default to board 2 (Bug Reports) if no matching labels found
-        return "2"
+                assigned_board = self.astuto_boards[label_name]
+                assignment_reason = f"matched board name: {label_name}"
+                break
+                
+            # Priority 3: Special label mappings
+            if label_name == "type: bug":
+                assigned_board = "2"
+                assignment_reason = "bug type label"
+                break
+            elif label_name in ["type: feature-request", "type: enhancement"]:
+                assigned_board = "1"
+                assignment_reason = "feature/enhancement type label"
+                break
+
+        logger.info(f"Board assignment: {assigned_board} (Reason: {assignment_reason})")
+        return assigned_board
 
     def print_astuto_info(self):
         """Print all available Astuto information"""
@@ -163,7 +180,7 @@ class PublicGitHubToAstuto:
                 
         logger.info(f"Total issues fetched: {len(issues)}")
         return issues
-
+    
     def create_astuto_post(self, board_id, issue):
         """Create a post in Astuto from GitHub issue"""
         logger.debug(f"Creating Astuto post for issue #{issue['number']}")
@@ -231,8 +248,8 @@ class PublicGitHubToAstuto:
         
         # If no status matches found and it's in bug board, set bug status
         if not matched_statuses and str(issue.get('board_id')) == "2":
-            if "bug" in self.astuto_statuses:
-                matched_statuses.append(("bug", self.astuto_statuses["bug"]))
+            if "type: bug" in self.astuto_statuses:
+                matched_statuses.append(("type: bug", self.astuto_statuses["type: bug"]))
         
         # Apply the highest status ID found
         if matched_statuses:
@@ -365,8 +382,8 @@ class PublicGitHubToAstuto:
         return connection_status
 
     def sync_new_issues(self, owner, repo, board_id):
-        """Sync new issues and comments"""
-        logger.info("Checking for new issues and comments...")
+        """Sync new issues and comments, and update existing posts"""
+        logger.info("Checking for new issues and updates...")
         issues = self.get_github_issues(owner, repo)
         
         # Get all existing posts
@@ -380,7 +397,20 @@ class PublicGitHubToAstuto:
             logger.error(f"Error fetching existing posts: {e}")
             return
         
+        # Create mapping of GitHub issue numbers to Astuto posts
+        issue_to_post = {}
+        for post in existing_posts:
+            desc = post.get('description', '')
+            if 'GitHub Issue #' in desc:
+                try:
+                    issue_num = int(desc.split('GitHub Issue #')[1].split('\n')[0])
+                    issue_to_post[issue_num] = post
+                except (ValueError, IndexError):
+                    continue
+        
         new_issues = 0
+        updated_issues = 0
+        
         for issue in issues:
             issue_number = issue['number']
             issue_reference = f"GitHub Issue #{issue_number}"
@@ -389,19 +419,17 @@ class PublicGitHubToAstuto:
             assigned_board = self.determine_board(issue.get('labels', []))
             logger.info(f"Issue #{issue_number} assigned to board {assigned_board}")
             
-            # Check if post exists and get its ID
-            existing_post = None
-            for post in existing_posts:
-                if issue_reference in post.get('description', ''):
-                    existing_post = post
-                    break
+            existing_post = issue_to_post.get(issue_number)
             
             if existing_post:
-                # Check if board needs to be updated
+                # Process existing post
                 current_board = str(existing_post.get('board_id'))
+                post_id = existing_post['id']
+                
+                # Check if board needs to be updated
                 if current_board != str(assigned_board):
-                    logger.info(f"Moving post {existing_post['id']} from board {current_board} to {assigned_board}")
-                    url = f"{self.astuto_base_url}/api/v1/posts/{existing_post['id']}/update_board"
+                    logger.info(f"Moving post {post_id} from board {current_board} to {assigned_board}")
+                    url = f"{self.astuto_base_url}/api/v1/posts/{post_id}/update_board"
                     try:
                         response = requests.put(
                             url,
@@ -409,26 +437,62 @@ class PublicGitHubToAstuto:
                             headers=self.astuto_headers
                         )
                         response.raise_for_status()
-                        logger.info(f"Successfully moved post {existing_post['id']} to board {assigned_board}")
+                        logger.info(f"Successfully moved post {post_id} to board {assigned_board}")
+                        updated_issues += 1
                     except requests.exceptions.RequestException as e:
                         logger.error(f"Error updating board: {e}")
                 
-                # Update status of existing post
-                self.update_post_status(existing_post['id'], issue)
+                # Update post content if changed
+                current_title = existing_post.get('title', '')
+                current_description = existing_post.get('description', '')
                 
-                # Sync comments for existing post
-                self.sync_comments(existing_post['id'], issue_number, owner, repo)
+                new_title = issue['title'][:128] if len(issue['title']) > 128 else issue['title']
+                new_description = self.format_issue_description(issue)
+                
+                if current_title != new_title or current_description != new_description:
+                    url = f"{self.astuto_base_url}/api/v1/posts/{post_id}"
+                    try:
+                        response = requests.put(
+                            url,
+                            json={"title": new_title, "description": new_description},
+                            headers=self.astuto_headers
+                        )
+                        response.raise_for_status()
+                        logger.info(f"Updated content for post {post_id}")
+                        updated_issues += 1
+                    except requests.exceptions.RequestException as e:
+                        logger.error(f"Error updating post content: {e}")
+                
+                # Update status based on current labels
+                self.update_post_status(post_id, issue)
+                
+                # Sync comments
+                self.sync_comments(post_id, issue_number, owner, repo)
+                
             else:
-                # Create new post in correct board
+                # Create new post
                 logger.info(f"Creating new post for issue #{issue_number} in board {assigned_board}")
                 result = self.create_astuto_post(assigned_board, issue)
                 if result:
                     new_issues += 1
-                    # Sync comments for new post
                     self.sync_comments(result['id'], issue_number, owner, repo)
                 time.sleep(1)
         
-        logger.info(f"Sync completed. {new_issues} new issues processed.")
+        logger.info(f"Sync completed. {new_issues} new issues processed, {updated_issues} existing issues updated.")
+
+    def format_issue_description(self, issue):
+        """Format the description for an Astuto post"""
+        labels = ", ".join([label['name'] for label in issue.get('labels', [])])
+        
+        return (
+            f"{issue.get('body', 'No description provided')}\n\n"
+            f"---\n"
+            f"Originally from GitHub Issue #{issue['number']}\n"
+            f"Status: {issue['state']}\n"
+            f"Labels: {labels}\n"
+            f"Created at: {issue['created_at']}\n"
+            f"Original URL: [{issue['html_url']}]({issue['html_url']})"
+        )
 
 def run_sync():
     """Run the synchronization process"""
