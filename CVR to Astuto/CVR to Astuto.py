@@ -156,42 +156,40 @@ class PublicGitHubToAstuto:
         except requests.exceptions.RequestException as e:
             logger.error(f"Error fetching Astuto statuses: {e}")
 
-def determine_board(self, issue_labels):
-    """Determine which board to use based on issue labels"""
-    assignment_reason = "default"
-    assigned_board = "2"  # Default to Bug Reports
+    def determine_board(self, issue_labels):
+        """Determine which board to use based on issue labels"""
+        assigned_board = "2"  # Default to Bug Reports
+        label_priority = None
+        assignment_reason = "default"
 
-    # First check for hellonext source - highest priority
-    for label in issue_labels:
-        label_name = label['name'].lower()
-        if label_name == "source: hellonext":
-            assigned_board = "4"  # Hellonext board
-            assignment_reason = "hellonext source"
-            logger.info(f"Board assignment: {assigned_board} (Reason: {assignment_reason})")
-            return assigned_board
+        # First check if this is a Hellonext issue
+        for label in issue_labels:
+            if label['name'].lower() == "source: hellonext":
+                assigned_board = "4"  # Hellonext board
+                assignment_reason = "hellonext source"
+                break
 
-    # If not hellonext source, follow normal priority order
-    for label in issue_labels:
-        label_name = label['name'].lower()
-        
-        # Priority 2: Direct board name matches
-        if label_name in self.astuto_boards:
-            assigned_board = self.astuto_boards[label_name]
-            assignment_reason = f"matched board name: {label_name}"
-            break
-        # Priority 3: Special label mappings
-        elif label_name == "type: bug":
-            assigned_board = "2"
-            assignment_reason = "bug type label"
-            break
-        elif label_name in ["type: feature-request", "type: enhancement"]:
-            assigned_board = "1"
-            assignment_reason = "feature/enhancement type label"
-            break
+        # Now determine label priority regardless of board
+        for label in issue_labels:
+            label_name = label['name'].lower()
+            
+            # Priority 1: Direct board name matches
+            if label_name in self.astuto_boards and label_name != "hellonext":
+                label_priority = label_name
+                assignment_reason += f", priority from board name: {label_name}"
+                break
+            # Priority 2: Special label mappings
+            elif label_name == "type: bug":
+                label_priority = "bug"
+                assignment_reason += ", priority from bug type"
+                break
+            elif label_name in ["type: feature-request", "type: enhancement"]:
+                label_priority = "feature"
+                assignment_reason += ", priority from feature type"
+                break
 
-    logger.info(f"Board assignment: {assigned_board} (Reason: {assignment_reason})")
-    return assigned_board
-
+        logger.info(f"Board assignment: {assigned_board} (Reason: {assignment_reason})")
+        return assigned_board
 
     def get_github_issues(self, owner, repo):
         """Fetch issues from GitHub with date filtering and retry logic"""
