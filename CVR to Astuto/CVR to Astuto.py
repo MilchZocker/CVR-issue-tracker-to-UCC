@@ -170,26 +170,128 @@ class PublicGitHubToAstuto:
                 break
 
         # Now determine label priority regardless of board
+        # First check for status: labels
         for label in issue_labels:
             label_name = label['name'].lower()
-            
-            # Priority 1: Direct board name matches
-            if label_name in self.astuto_boards and label_name != "hellonext":
+            if label_name.startswith('status:'):
                 label_priority = label_name
-                assignment_reason += f", priority from board name: {label_name}"
+                assignment_reason += f", priority from status label: {label_name}"
                 break
-            # Priority 2: Special label mappings
-            elif label_name == "type: bug":
-                label_priority = "bug"
-                assignment_reason += ", priority from bug type"
-                break
-            elif label_name in ["type: feature-request", "type: enhancement"]:
-                label_priority = "feature"
-                assignment_reason += ", priority from feature type"
-                break
+
+        # If no status: label found, check for in: labels
+        if not label_priority:
+            for label in issue_labels:
+                label_name = label['name'].lower()
+                if label_name.startswith('in:'):
+                    label_priority = label_name
+                    assignment_reason += f", priority from location label: {label_name}"
+                    break
+
+        # If still no priority, check other label types
+        if not label_priority:
+            for label in issue_labels:
+                label_name = label['name'].lower()
+                
+                # Priority 1: Direct board name matches (except hellonext)
+                if label_name in self.astuto_boards and label_name != "hellonext":
+                    label_priority = label_name
+                    assignment_reason += f", priority from board name: {label_name}"
+                    break
+                # Priority 2: Special label mappings
+                elif label_name == "type: bug":
+                    label_priority = "bug"
+                    assignment_reason += ", priority from bug type"
+                    break
+                elif label_name in ["type: feature-request", "type: enhancement"]:
+                    label_priority = "feature"
+                    assignment_reason += ", priority from feature type"
+                    break
 
         logger.info(f"Board assignment: {assigned_board} (Reason: {assignment_reason})")
         return assigned_board
+
+    def update_post_status(self, post_id, issue):
+        """Update post status based on GitHub issue labels with priority order and status validation"""
+        matched_status = None
+        assignment_reason = "default"
+        
+        # Get all labels and sort them by priority
+        priority_labels = {
+            'status:': [],
+            'in:': [],
+            'type:': []
+        }
+        
+        # Categorize labels by their prefix
+        for label in issue.get('labels', []):
+            label_name = label['name'].lower()
+            if label_name.startswith('status:'):
+                priority_labels['status:'].append(label_name)
+            elif label_name.startswith('in:'):
+                priority_labels['in:'].append(label_name)
+            elif label_name.startswith('type:'):
+                priority_labels['type:'].append(label_name)
+
+        # Check labels in priority order
+        for prefix in ['status:', 'in:', 'type:']:
+            for label_name in priority_labels[prefix]:
+                if label_name in self.astuto_statuses:
+                    matched_status = label_name
+                    assignment_reason = f"matched {prefix} label"
+                    break
+            if matched_status:
+                break
+
+        # If no matching status found and it's a bug report, try default bug status
+        if not matched_status and str(issue.get('board_id')) == "2":
+            if "type: bug" in self.astuto_statuses:
+                matched_status = "type: bug"
+                assignment_reason = "default bug status"
+
+        if matched_status:
+            url = f"{self.astuto_base_url}/api/v1/posts/{post_id}/update_status"
+            payload = {"post_status_id": self.astuto_statuses[matched_status]}
+            
+            try:
+                self.make_astuto_request('put', url, json=payload, headers=self.astuto_headers)
+                logger.info(f"Successfully updated post {post_id} status to {matched_status} ({assignment_reason})")
+                return True
+            except Exception as e:
+                logger.error(f"Error updating post status: {e}")
+                if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                    logger.error(f"Response content: {e.response.text}")
+                return False
+        else:
+            logger.warning(f"No matching status found in Astuto for post {post_id}")
+            return False
+
+    def delete_missing_posts(self, github_issues, existing_posts):
+        """Delete posts from Astuto that no longer exist on GitHub"""
+        github_issue_numbers = set(issue['number'] for issue in github_issues)
+        deleted_count = 0
+
+        for post in existing_posts:
+            desc = post.get('description', '')
+            if 'GitHub Issue #' in desc:
+                try:
+                    issue_num = int(desc.split('GitHub Issue #')[1].split('\n')[0])
+                    if issue_num not in github_issue_numbers:
+                        # Delete post from Astuto
+                        url = f"{self.astuto_base_url}/api/v1/posts/{post['id']}"
+                        try:
+                            self.make_astuto_request('delete', url, headers=self.astuto_headers)
+                            logger.info(f"Deleted post {post['id']} (GitHub Issue #{issue_num}) as it no longer exists on GitHub")
+                            deleted_count += 1
+                        except Exception as e:
+                            logger.error(f"Error deleting post {post['id']}: {e}")
+                            if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                                logger.error(f"Response content: {e.response.text}")
+                except (ValueError, IndexError):
+                    continue
+
+        if deleted_count > 0:
+            logger.info(f"Deleted {deleted_count} posts that no longer exist on GitHub")
+        return deleted_count
 
     def get_github_issues(self, owner, repo):
         """Fetch issues from GitHub with date filtering and retry logic"""
@@ -425,6 +527,9 @@ class PublicGitHubToAstuto:
             new_issues = 0
             updated_issues = 0
             
+            # Delete posts that no longer exist on GitHub
+            deleted_posts = self.delete_missing_posts(issues, existing_posts)
+            
             for issue in issues:
                 # Add delay between operations to prevent rate limiting
                 time.sleep(1)
@@ -446,29 +551,64 @@ class PublicGitHubToAstuto:
             self.sync_state['last_sync'] = datetime.utcnow().isoformat()
             self.save_sync_state()
             
-            logger.info(f"Sync completed. {new_issues} new issues, {updated_issues} updates")
+            logger.info(f"Sync completed. {new_issues} new issues, {updated_issues} updates, {deleted_posts} deletions")
             
         except Exception as e:
             logger.error(f"Error during sync: {e}")
             raise
 
-def run_sync():
-    """Run the synchronization process"""
-    astuto_api_key = os.getenv('ASTUTO_API_KEY')
-    astuto_base_url = os.getenv('ASTUTO_BASE_URL')
-    board_id = os.getenv('ASTUTO_BOARD_ID')
-    
-    owner = "Alpha-Blend-Interactive"
-    repo = "ChilloutVR"
+    def needs_update(self, issue, existing_post):
+        """Check if an issue needs to be updated in Astuto"""
+        issue_number = str(issue['number'])
+        issue_updated = issue['updated_at']
+        
+        if issue_number in self.sync_state['processed_issues']:
+            last_processed = self.sync_state['processed_issues'][issue_number]
+            if last_processed >= issue_updated:
+                return False
+        
+        current_title = existing_post.get('title', '')
+        current_description = existing_post.get('description', '')
+        
+        new_title = issue['title'][:128] if len(issue['title']) > 128 else issue['title']
+        new_description = self.format_issue_description(issue)
+        
+        labels_changed = self.have_labels_changed(issue, existing_post)
+        
+        return (current_title != new_title or 
+                current_description != new_description or 
+                labels_changed)
 
-    syncer = PublicGitHubToAstuto(astuto_api_key, astuto_base_url)
-    
-    connections = syncer.test_connections()
-    if not all(connections.values()):
-        logger.error("Connection tests failed. Skipping sync.")
-        return
+    def have_labels_changed(self, issue, existing_post):
+        """Check if issue labels have changed"""
+        current_labels = set(label['name'] for label in issue.get('labels', []))
+        desc = existing_post.get('description', '')
+        labels_line = next((line for line in desc.split('\n') if line.startswith('Labels:')), '')
+        existing_labels = set(label.strip() for label in labels_line.replace('Labels:', '').split(',') if label.strip())
+        return current_labels != existing_labels
 
-    syncer.sync_new_issues(owner, repo, board_id)
+    def update_existing_post(self, issue, existing_post):
+        """Update existing post with rate limiting"""
+        post_id = existing_post['id']
+        url = f"{self.astuto_base_url}/api/v1/posts/{post_id}"
+        
+        new_title = issue['title'][:128] if len(issue['title']) > 128 else issue['title']
+        new_description = self.format_issue_description(issue)
+        
+        payload = {
+            "title": new_title,
+            "description": new_description,
+            "updated_at": issue['updated_at']
+        }
+        
+        try:
+            self.make_astuto_request('put', url, json=payload, headers=self.astuto_headers)
+            logger.info(f"Updated content for post {post_id}")
+            self.update_post_status(post_id, issue)
+            return True
+        except Exception as e:
+            logger.error(f"Error updating post content: {e}")
+            return False
 
 def main():
     required_vars = ['ASTUTO_API_KEY', 'ASTUTO_BASE_URL', 'ASTUTO_BOARD_ID']
@@ -478,9 +618,22 @@ def main():
         logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         sys.exit(1)
 
+    syncer = PublicGitHubToAstuto(
+        os.getenv('ASTUTO_API_KEY'),
+        os.getenv('ASTUTO_BASE_URL')
+    )
+
+    def run_sync():
+        try:
+            # Updated to use the correct repository owner and name
+            syncer.sync_new_issues('Alpha-Blend-Interactive', 'ChilloutVR', os.getenv('ASTUTO_BOARD_ID'))
+            logger.info("Sync completed successfully")
+        except Exception as e:
+            logger.error(f"Error during sync: {e}")
+
     schedule.every(1).hour.do(run_sync)
     
-    run_sync()
+    run_sync()  # Run initial sync
     
     logger.info("Script is running. Will check for new issues every hour.")
     try:
